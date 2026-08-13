@@ -1,0 +1,247 @@
+//@version=6
+strategy("BRRC — Break · Range · Retracement · Continuation",
+     shorttitle = "BRRC",
+     overlay = true,
+     initial_capital = 25000,
+     margin_long = 5,       // futures margin ≈ 4-5% of notional; the v5+
+     margin_short = 5,      // default of 100% silently rejects every order
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.25,
+     slippage = 1,
+     calc_on_every_tick = false,
+     process_orders_on_close = true)
+
+//──────────────────────────────────────────────────────────────────────────────
+// BRRC prototype — futures continuation strategy
+//
+// Setup lifecycle:  HTF Bias → Break of Structure → Range → Retracement →
+//                   Confirmation → Entry.  Each setup is tracked by an explicit
+//                   state machine so a stale or invalidated setup can never
+//                   leak into a trade.
+//
+// Anti-repaint rules used throughout:
+//   · HTF data is read from the last CLOSED higher-timeframe bar only.
+//   · Swing points come from ta.pivothigh/pivotlow, which confirm
+//     `pivotRight` bars after the extreme — lagging but immutable.
+//   · A BOS requires a full BODY close through the swing level; a wick
+//     poking through never qualifies.
+//   · Orders are processed on bar close (no intrabar look-ahead).
+//──────────────────────────────────────────────────────────────────────────────
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpB = "Higher-timeframe bias"
+biasTf     = input.timeframe("60", "Bias timeframe", group = grpB)
+biasEmaLen = input.int(50, "Bias EMA length", minval = 5, group = grpB)
+
+grpS = "Structure / BOS"
+pivotLeft  = input.int(3, "Pivot left bars",  minval = 1, group = grpS)
+pivotRight = input.int(3, "Pivot right bars", minval = 1, group = grpS)
+
+grpR = "Range & retracement"
+rangeMinBars = input.int(3,  "Bars of pause that define a range", minval = 2, group = grpR)
+staleBars    = input.int(30, "Max bars per phase before the setup goes stale", minval = 5, group = grpR)
+retMin       = input.float(0.382, "Zone starts (breakout-leg fraction)", minval = 0.1, maxval = 0.9, step = 0.01, group = grpR)
+retMax       = input.float(1.0,   "Zone ends (breakout-leg fraction)",   minval = 0.2, maxval = 1.0, step = 0.01, group = grpR)
+
+grpX = "Risk / exits"
+atrLen  = input.int(14, "ATR length", group = grpX)
+atrMult = input.float(1.0, "Stop buffer (ATR ×)", step = 0.25, group = grpX)
+rMult   = input.float(2.0, "Target (R multiple)", step = 0.25, group = grpX)
+
+// ── HTF bias (non-repainting) ────────────────────────────────────────────────
+// `expr[1]` + lookahead_on returns the value of the last COMPLETED htf bar on
+// both historical and realtime bars — the documented non-repainting form of
+// request.security. The running htf bar is never read.
+htfClose = request.security(syminfo.tickerid, biasTf, close[1],                     lookahead = barmerge.lookahead_on)
+htfEma   = request.security(syminfo.tickerid, biasTf, ta.ema(close, biasEmaLen)[1], lookahead = barmerge.lookahead_on)
+biasLong  = htfClose > htfEma
+biasShort = htfClose < htfEma
+
+// ── Confirmed swing structure ────────────────────────────────────────────────
+// Pivots confirm `pivotRight` bars after the extreme prints. That lag is the
+// price of immutability: once set, a swing level never moves.
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low,  pivotLeft, pivotRight)
+var float swingHigh = na
+var float swingLow  = na
+if not na(ph)
+    swingHigh := ph
+if not na(pl)
+    swingLow := pl
+
+// ── Setup state machine ──────────────────────────────────────────────────────
+ST_IDLE    = 0
+ST_BREAK   = 1
+ST_RANGE   = 2
+ST_RETRACE = 3
+
+type Setup
+    int   state     = 0
+    int   dir       = 0     // +1 long setup · -1 short setup
+    float bosLevel  = na    // swing level broken by the BOS
+    float legExt    = na    // extreme reached by the leg after the BOS
+    int   stateBar  = 0     // bar_index where the current phase began
+    int   pauseBars = 0     // consecutive bars without a new leg extreme
+    float pullExt   = na    // deepest point reached inside the retracement
+
+method reset(Setup s) =>
+    s.state     := ST_IDLE
+    s.dir       := 0
+    s.bosLevel  := na
+    s.legExt    := na
+    s.stateBar  := 0
+    s.pauseBars := 0
+    s.pullExt   := na
+
+// The retracement zone is measured over the BREAKOUT leg (broken level →
+// post-break extreme), so it always sits on the continuation side of the
+// level: tagging it never requires closing back through the BOS. A body
+// close through the level remains the final, coherent invalidation.
+method zoneTop(Setup s) =>
+    s.dir > 0 ? s.legExt - (s.legExt - s.bosLevel) * retMin : s.legExt + (s.bosLevel - s.legExt) * retMin
+
+method zoneBottom(Setup s) =>
+    s.dir > 0 ? s.legExt - (s.legExt - s.bosLevel) * retMax : s.legExt + (s.bosLevel - s.legExt) * retMax
+
+var Setup setup = Setup.new()
+atr = ta.atr(atrLen)
+
+// Funnel counters (HUD): how far setups get before dying.
+var int nBos     = 0
+var int nRange   = 0
+var int nRetrace = 0
+var int nEntry   = 0
+var int nFailed  = 0
+var int nStale   = 0
+
+// Each swing level may fire at most one setup, so a BOS is an event even
+// when the pivot confirms with price already through the level (common in
+// trends — a crossing-only definition misses all of those).
+var float usedHigh = na
+var float usedLow  = na
+stateBefore = setup.state
+
+// A body close back through the broken level kills the setup in any phase.
+failedBreak = setup.state != ST_IDLE and (setup.dir > 0 ? close < setup.bosLevel : close > setup.bosLevel)
+// Any phase that overstays goes stale.
+staleSetup  = setup.state != ST_IDLE and bar_index - setup.stateBar > staleBars
+
+if strategy.position_size == 0
+    if failedBreak or staleSetup
+        nFailed += failedBreak ? 1 : 0
+        nStale  += staleSetup and not failedBreak ? 1 : 0
+        setup.reset()
+    else
+        switch setup.state
+
+            ST_IDLE =>
+                // BOS = body CLOSE beyond the most recent confirmed swing, in
+                // the direction of the HTF bias. `usedHigh/usedLow` guarantee
+                // one setup per level — a break is an event, not a state.
+                // `na(used…) or` — a comparison against na is itself na
+                // (falsy), so the guard must special-case the virgin state.
+                bullBos = biasLong  and not na(swingHigh) and close > swingHigh and (na(usedHigh) or swingHigh != usedHigh)
+                bearBos = biasShort and not na(swingLow)  and close < swingLow  and (na(usedLow)  or swingLow  != usedLow)
+                if bullBos or bearBos
+                    setup.dir       := bullBos ? 1 : -1
+                    setup.bosLevel  := bullBos ? swingHigh : swingLow
+                    setup.legExt    := bullBos ? high : low
+                    setup.state     := ST_BREAK
+                    setup.stateBar  := bar_index
+                    setup.pauseBars := 0
+                    if bullBos
+                        usedHigh := swingHigh
+                    else
+                        usedLow := swingLow
+                    nBos += 1
+
+            ST_BREAK =>
+                // The leg keeps extending until it pauses. `rangeMinBars`
+                // consecutive bars without a new extreme = the range phase.
+                // The pullback often starts during the pause itself, so its
+                // extreme is tracked from the first pause bar onward.
+                newExt = setup.dir > 0 ? high > setup.legExt : low < setup.legExt
+                if newExt
+                    setup.legExt    := setup.dir > 0 ? math.max(setup.legExt, high) : math.min(setup.legExt, low)
+                    setup.pauseBars := 0
+                    setup.pullExt   := na
+                    setup.stateBar  := bar_index   // an extending leg is alive, not stale
+                else
+                    setup.pauseBars := setup.pauseBars + 1
+                    setup.pullExt   := setup.dir > 0 ?
+                         (na(setup.pullExt) ? low  : math.min(setup.pullExt, low)) :
+                         (na(setup.pullExt) ? high : math.max(setup.pullExt, high))
+                    if setup.pauseBars >= rangeMinBars
+                        setup.state    := ST_RANGE
+                        setup.stateBar := bar_index
+                        nRange += 1
+
+            ST_RANGE =>
+                // A fresh extreme re-opens the break phase (continuation of
+                // the same leg). Otherwise keep tracking the pullback — which
+                // may already have tagged the zone during the pause bars.
+                newExt = setup.dir > 0 ? high > setup.legExt : low < setup.legExt
+                if newExt
+                    setup.legExt    := setup.dir > 0 ? math.max(setup.legExt, high) : math.min(setup.legExt, low)
+                    setup.state     := ST_BREAK
+                    setup.stateBar  := bar_index
+                    setup.pauseBars := 0
+                    setup.pullExt   := na
+                else
+                    setup.pullExt := setup.dir > 0 ?
+                         (na(setup.pullExt) ? low  : math.min(setup.pullExt, low)) :
+                         (na(setup.pullExt) ? high : math.max(setup.pullExt, high))
+                    tagged = setup.dir > 0 ? setup.pullExt <= setup.zoneTop() : setup.pullExt >= setup.zoneTop()
+                    if tagged
+                        setup.state    := ST_RETRACE
+                        setup.stateBar := bar_index
+                        nRetrace += 1
+
+            ST_RETRACE =>
+                setup.pullExt := setup.dir > 0 ? math.min(setup.pullExt, low) : math.max(setup.pullExt, high)
+                // A body close beyond the deep edge of the zone invalidates
+                // the continuation premise entirely.
+                tooDeep = setup.dir > 0 ? close < setup.zoneBottom() : close > setup.zoneBottom()
+                if tooDeep
+                    setup.reset()
+                else
+                    // Confirmation: a close reclaiming the prior bar's
+                    // extreme in the setup direction.
+                    confirmed = setup.dir > 0 ? close > high[1] : close < low[1]
+                    if confirmed
+                        isLong  = setup.dir > 0
+                        stopPx  = isLong ? setup.pullExt - atr * atrMult : setup.pullExt + atr * atrMult
+                        riskPx  = math.abs(close - stopPx)
+                        tgtPx   = isLong ? close + riskPx * rMult : close - riskPx * rMult
+                        // JSON payload consumed by the webhook → broker bridge
+                        // (dedupe by id, position sync, stop/target placement
+                        // happen server-side, never in Pine).
+                        entryJson = '{"strategy":"BRRC","id":"' + str.tostring(bar_index) + '","side":"' + (isLong ? "buy" : "sell") + '","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPx) + ',"target":' + str.tostring(tgtPx) + '}'
+                        strategy.entry(isLong ? "BRRC-L" : "BRRC-S", isLong ? strategy.long : strategy.short, alert_message = entryJson)
+                        strategy.exit("exit", isLong ? "BRRC-L" : "BRRC-S", stop = stopPx, limit = tgtPx,
+                             alert_message = '{"strategy":"BRRC","action":"flatten","symbol":"' + syminfo.ticker + '"}')
+                        nEntry += 1
+                        setup.reset()
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+bgcolor(biasLong ? color.new(color.teal, 94) : biasShort ? color.new(color.red, 94) : na, title = "HTF bias")
+
+showZone = setup.state == ST_RANGE or setup.state == ST_RETRACE
+pTop = plot(showZone ? setup.zoneTop()    : na, "Retrace zone top",    style = plot.style_linebr, color = color.new(color.blue, 40))
+pBot = plot(showZone ? setup.zoneBottom() : na, "Retrace zone bottom", style = plot.style_linebr, color = color.new(color.blue, 40))
+fill(pTop, pBot, color = color.new(color.blue, 88), title = "Retrace zone")
+plot(setup.state != ST_IDLE ? setup.bosLevel : na, "BOS level", style = plot.style_linebr, color = color.orange, linewidth = 2)
+
+if setup.state != stateBefore and setup.state != ST_IDLE
+    txt = setup.state == ST_BREAK ? "BOS" : setup.state == ST_RANGE ? "Range" : "Retrace"
+    label.new(bar_index, setup.dir > 0 ? low : high, txt,
+         style = setup.dir > 0 ? label.style_label_up : label.style_label_down,
+         color = color.new(color.gray, 30), textcolor = color.white, size = size.small)
+
+var table hud = table.new(position.middle_left, 1, 4, border_width = 1)
+if barstate.islast
+    stateName = setup.state == ST_IDLE ? "Idle" : setup.state == ST_BREAK ? "Break" : setup.state == ST_RANGE ? "Range" : "Retrace"
+    table.cell(hud, 0, 0, "Bias: " + (biasLong ? "Long" : biasShort ? "Short" : "Flat"), text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(hud, 0, 1, "Setup: " + stateName + (setup.state != ST_IDLE ? (setup.dir > 0 ? " ▲" : " ▼") : ""), text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(hud, 0, 2, "BOS " + str.tostring(nBos) + " → Rng " + str.tostring(nRange) + " → Ret " + str.tostring(nRetrace) + " → In " + str.tostring(nEntry), text_color = color.yellow, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(hud, 0, 3, "Died: break " + str.tostring(nFailed) + " · stale " + str.tostring(nStale), text_color = color.orange, bgcolor = color.new(color.gray, 20), text_size = size.small)
