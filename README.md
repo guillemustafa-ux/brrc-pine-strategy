@@ -37,8 +37,7 @@ and phases cannot be skipped.
 Entries/exits emit a **JSON `alert_message`** meant for a webhook → broker
 bridge (Tradovate, Binance, etc.). Order deduplication, position
 synchronization and stop/target placement belong server-side — Pine only
-signals. This mirrors the architecture I run in production for a
-TradingView-alert → exchange execution bot.
+signals. This prototype is built to feed such a bridge; it does not include one.
 
 ## Usage
 
